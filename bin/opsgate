@@ -1,0 +1,498 @@
+#!/usr/bin/env bash
+# opsgate — manage the OpsGate Agent on this server. Run `sudo opsgate help`.
+set -euo pipefail
+
+APP=/opt/opsgate/app
+VENV=/opt/opsgate/venv
+PY="$VENV/bin/python"
+ETC=/etc/opsgate
+ENVF=$ETC/env
+CONF=$ETC/install.conf
+WRITE_LIST=$ETC/write-paths
+READ_LIST=$ETC/read-paths
+RESTART_LIST=$ETC/restart-services
+TOKENS_DB=$ETC/tokens.json
+UNIT=opsgate
+DROPIN=/etc/systemd/system/opsgate.service.d
+SUDOERS=/etc/sudoers.d/opsgate
+SVC_USER=opsgate
+STATE=/var/lib/opsgate
+
+if [ -t 1 ]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; D=$'\e[2m'; N=$'\e[0m'; else B=; G=; Y=; R=; D=; N=; fi
+ok()   { echo "${G}✓${N} $*"; }
+warn() { echo "${Y}!${N} $*" >&2; }
+die()  { echo "${R}✗${N} $*" >&2; exit 1; }
+need_root() { [ "$(id -u)" -eq 0 ] || die "Run with sudo: sudo opsgate $*"; }
+conf() { [ -f "$CONF" ] && sed -n "s/^$1=//p" "$CONF" | tail -n1 || true; }
+envget() { "$PY" "$APP/scripts/envfile.py" "$ENVF" get "$1" 2>/dev/null || true; }
+envset() { "$PY" "$APP/scripts/envfile.py" "$ENVF" set "$@"; }
+restart() { systemctl restart "$UNIT" && sleep 1 && systemctl is-active -q "$UNIT" && ok "Agent restarted" \
+            || die "The agent did not start. See: sudo opsgate logs"; }
+maybe_restart() { if systemctl is-active -q "$UNIT" 2>/dev/null; then restart; fi; }  # not during install
+connector_url() { local u; u="$(envget MCP_PUBLIC_URL)"; [ -n "$u" ] && echo "${u%/}/mcp"; }
+
+# Directories that are never granted (whole system trees, the agent's own files).
+forbidden_dir() {
+  case "$1" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib32|/lib64|/libx32|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/lib|/var/log|/usr/local) return 0;;
+    /etc/opsgate|/etc/opsgate/*|/opt/opsgate|/opt/opsgate/*|/var/lib/opsgate|/var/lib/opsgate/*|/var/log/opsgate|/var/log/opsgate/*|/var/backups/opsgate|/var/backups/opsgate/*) return 0;;
+    /etc/sudoers*|/etc/shadow*|/etc/gshadow*|/etc/ssh|/etc/ssh/*|/root/*|/proc/*|/sys/*|/dev/*|/boot/*) return 0;;
+  esac
+  return 1
+}
+
+norm_path() {  # absolute, existing directory or file, no trailing slash
+  local p="$1"
+  [ "${p:0:1}" = "/" ] || die "Use an absolute path: $p"
+  [ -e "$p" ] || die "Does not exist: $p"
+  p="$(realpath -e -- "$p")"
+  echo "${p%/}"
+}
+
+list_add() { touch "$1"; chmod 600 "$1"; grep -qxF -- "$2" "$1" || echo "$2" >> "$1"; }
+list_del() { [ -f "$1" ] || return 0; grep -vxF -- "$2" "$1" > "$1.tmp" || true; mv "$1.tmp" "$1"; chmod 600 "$1"; }
+list_items() { [ -f "$1" ] && grep -v '^\s*$' "$1" || true; }
+
+grant_traverse() {  # let the service user walk down to $1 (execute bit only on the parents)
+  local d; d="$(dirname "$1")"
+  while [ "$d" != "/" ]; do
+    if ! runuser -u "$SVC_USER" -- test -x "$d" 2>/dev/null; then setfacl -m "u:$SVC_USER:--x" "$d"; fi
+    d="$(dirname "$d")"
+  done
+}
+
+strip_secrets() {  # secret files inside a granted folder: explicit "no access" for the agent's user
+  # (a named-user ACL entry wins over the "other" bits, so even world-readable secrets stay closed)
+  find "$1" \( -name '.env' -o -name '.env.*' -o -name '*.pem' -o -name '*.key' -o -name 'id_rsa*' \
+       -o -name 'id_ed25519*' -o -name '*.p12' -o -name '*.pfx' -o -name '*.kdbx' -o -name 'credentials*' \) \
+       -exec setfacl -m "u:$SVC_USER:---" {} + 2>/dev/null || true
+}
+
+grant() {  # grant <path> <rwX|rX>
+  local p="$1" perm="$2"
+  setfacl -R -m "u:$SVC_USER:$perm" "$p"
+  if [ -d "$p" ]; then find "$p" -type d -exec setfacl -d -m "u:$SVC_USER:$perm" {} +; fi
+  strip_secrets "$p"
+  grant_traverse "$p"
+}
+
+revoke() {
+  local p="$1"
+  [ -e "$p" ] || return 0
+  setfacl -R -x "u:$SVC_USER" "$p" 2>/dev/null || true
+  if [ -d "$p" ]; then find "$p" -type d -exec setfacl -d -x "u:$SVC_USER" {} + 2>/dev/null || true; fi
+}
+
+# ---- access profiles: readonly (base), network, asterisk, full  (stored as MCP_ACCESS)
+access_get() { local a; a="$(envget MCP_ACCESS)"; echo "${a:-readonly}"; }
+access_has() { [[ ",$(access_get)," == *",$1,"* ]]; }
+have_tty() { { : </dev/tty; } 2>/dev/null; }
+
+valid_service() { [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9_.@-]{0,99}$ ]]; }  # no ":" "," "=": special in sudoers
+
+apply() {
+  # 1) systemd: folders the agent may write (everything else is read-only for it)
+  install -d -m 755 "$DROPIN"
+  local rw="" p
+  while IFS= read -r p; do [ -n "$p" ] && rw="$rw -$p"; done < <(list_items "$WRITE_LIST")
+  printf '[Service]\nReadWritePaths=%s\n' "${rw:- -/nonexistent}" > "$DROPIN/write-paths.conf"
+  # 2) sudo: exactly the restarts the owner allowed (+ the read-only Asterisk wrapper)
+  local tmp; tmp="$(mktemp)"
+  {
+    echo "# Managed by 'opsgate'. Change with: sudo opsgate allow-restart <service> / deny-restart <service>"
+    echo "Defaults:$SVC_USER env_reset, !lecture"
+    local s
+    while IFS= read -r s; do
+      valid_service "$s" || continue
+      echo "$SVC_USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart $s, /usr/bin/systemctl kill -s HUP --kill-whom=main $s"
+    done < <(list_items "$RESTART_LIST")
+    [ -x /usr/local/sbin/opsgate-asterisk ] && echo "$SVC_USER ALL=(root) NOPASSWD: /usr/local/sbin/opsgate-asterisk *"
+  } > "$tmp"
+  # 3) profiles: "full" lets the agent's user run anything as root and relaxes the service hardening
+  #    (a root shell would otherwise still see a read-only system); "asterisk" lets the wrapper reload.
+  if access_has full; then
+    echo "$SVC_USER ALL=(ALL) NOPASSWD: ALL" >> "$tmp"
+    rm -f "$DROPIN/access.conf"   # older name; "zz-" sorts after write-paths.conf so the reset below wins
+    cat > "$DROPIN/zz-access.conf" <<'EOF3'
+# Written by `sudo opsgate access` while the "full" profile is on. Removed when you switch it off.
+[Service]
+# No per-folder bind mounts: a root shell must see the real filesystem (e.g. to delete a folder).
+ReadWritePaths=
+ProtectSystem=no
+ProtectHome=no
+PrivateTmp=no
+ProtectKernelTunables=no
+ProtectKernelModules=no
+ProtectKernelLogs=no
+ProtectControlGroups=no
+ProtectClock=no
+RestrictNamespaces=no
+RestrictRealtime=no
+RestrictSUIDSGID=no
+LockPersonality=no
+RestrictAddressFamilies=
+UMask=0022
+EOF3
+  else
+    rm -f "$DROPIN/access.conf" "$DROPIN/zz-access.conf"
+  fi
+  if access_has asterisk; then : > "$ETC/asterisk-reload"; chmod 600 "$ETC/asterisk-reload"; else rm -f "$ETC/asterisk-reload"; fi
+  if visudo -cf "$tmp" >/dev/null; then install -m 440 -o root -g root "$tmp" "$SUDOERS"; else rm -f "$tmp"; die "sudoers validation failed; nothing changed"; fi
+  rm -f "$tmp"
+  systemctl daemon-reload
+}
+
+access_summary() {
+  local a; a="$(access_get)"
+  echo "  ${B}Access:${N} $a"
+  access_has full && echo "    ${R}FULL ACCESS is ON${N}: the AI can run any command as root (sudo opsgate access readonly to switch it off)"
+  access_has network && echo "    network: curl, with confirmation each time"
+  access_has asterisk && echo "    asterisk: reload commands, with confirmation each time"
+  true
+}
+
+access_apply() {  # access_apply profile,profile
+  local list="$1"
+  envset "MCP_ACCESS=$list"
+  apply
+  maybe_restart
+  ok "Access is now: $list"
+  access_has full && warn "FULL ACCESS is on: the AI can do anything on this server. Turn it off with: sudo opsgate access readonly"
+  true
+}
+
+access_menu() {
+  local cur; cur="$(access_get)"
+  echo
+  echo "${B}What may the AI do on this server?${N}  ${D}(now: $cur)${N}"
+  echo "  1) Read only      look at files, logs, services and databases; changes nothing  ${D}(safest start)${N}"
+  echo "  2) + Network      run curl to call APIs (asks you to confirm each time)"
+  echo "  3) + Asterisk     reload dialplan / PJSIP / modules (asks you to confirm each time)"
+  echo "  4) ${R}FULL ACCESS${N}   a root shell, like an SSH login: any command, edit the database, run scripts"
+  echo "                    ${D}only on a server you own. You can change this any time: sudo opsgate access${N}"
+  local ans=""
+  read -r -p "Choose one or more, e.g. 2,3  (Enter = keep current): " ans </dev/tty || ans=""
+  [ -n "$ans" ] || { echo "Unchanged."; return 0; }
+  local pick="" n
+  for n in $(echo "$ans" | tr ',;' '  '); do
+    case "$n" in
+      1) ;; 2) pick="$pick,network" ;; 3) pick="$pick,asterisk" ;; 4) pick="$pick,full" ;;
+      *) die "Unknown choice: $n" ;;
+    esac
+  done
+  pick="readonly$pick"
+  if [[ "$pick" == *full* ]]; then
+    echo "${Y}Full access gives the AI the same power as logging in as root.${N}"
+    local c=""; read -r -p "Type FULL to confirm: " c </dev/tty || c=""
+    [ "$c" = "FULL" ] || die "Not confirmed. Nothing changed."
+  fi
+  access_apply "$pick"
+}
+
+AU_UNIT=opsgate-autoupdate
+AU_LOG=/var/log/opsgate/autoupdate.log
+au_log() { echo "$(date -u +%FT%TZ) $*" >> "$AU_LOG"; chmod 640 "$AU_LOG" 2>/dev/null || true; echo "$*"; }
+
+autoupdate_on() {  # autoupdate_on HH:MM
+  local at="${1:-03:30}"
+  [[ "$at" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "Use a time like 03:30 (24h, this server's clock)"
+  cat > "/etc/systemd/system/$AU_UNIT.service" <<EOF3
+[Unit]
+Description=OpsGate Agent automatic update (only when a newer signed version exists)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/opsgate update --auto
+EOF3
+  cat > "/etc/systemd/system/$AU_UNIT.timer" <<EOF3
+[Unit]
+Description=Daily check for a new OpsGate Agent version at $at
+[Timer]
+OnCalendar=*-*-* $at:00
+RandomizedDelaySec=20min
+Persistent=false
+[Install]
+WantedBy=timers.target
+EOF3
+  systemctl daemon-reload
+  systemctl enable -q --now "$AU_UNIT.timer"
+  ok "Automatic updates ON: every day around $at (server time $(date +%Z)), only signed versions, and only if the AI is not working at that moment."
+  echo "  ${D}If a new version does not start, the previous one is restored by itself. Log: $AU_LOG${N}"
+}
+
+autoupdate_off() {
+  systemctl disable -q --now "$AU_UNIT.timer" 2>/dev/null || true
+  rm -f "/etc/systemd/system/$AU_UNIT.timer" "/etc/systemd/system/$AU_UNIT.service"
+  systemctl daemon-reload
+  ok "Automatic updates OFF. Update by hand with: sudo opsgate update"
+}
+
+autoupdate_status() {
+  if [ -f "/etc/systemd/system/$AU_UNIT.timer" ]; then
+    echo "  Auto-update:    on, $(sed -n 's/^OnCalendar=\*-\*-\* \(..:..\).*/\1/p' "/etc/systemd/system/$AU_UNIT.timer") server time$( [ -f "$AU_LOG" ] && echo " · last: $(tail -n1 "$AU_LOG")")"
+  else
+    echo "  Auto-update:    off  (sudo opsgate autoupdate on)"
+  fi
+}
+
+cmd_status() {
+  local active url plan
+  active="$(systemctl is-active "$UNIT" 2>/dev/null || true)"
+  url="$(connector_url || true)"
+  echo "${B}OpsGate Agent$( [ -f "$APP/VERSION" ] && echo " $(cat "$APP/VERSION")" )${N}"
+  echo "  Service:        ${active:-not installed}"
+  echo "  Connector URL:  ${url:-unknown}"
+  echo "  Proxy:          $(conf PROXY_MODE) $(conf DOMAIN)"
+  echo "  Two-step login: $( [ -n "$(envget MCP_TOTP_SECRET)" ] && echo on || echo "off  (sudo opsgate 2fa on)" )"
+  if [ -f "$STATE/meter.json" ]; then
+    "$PY" - "$STATE/meter.json" <<'PYEOF'
+import json, sys, time
+s = json.load(open(sys.argv[1]))
+used = s.get("used", 0) + s.get("pending", 0) + ((s.get("inflight") or {}).get("delta", 0))
+limit = s.get("limit")
+plan = (s.get("plan") or "unknown").capitalize()
+lim = f"{limit:,}" if isinstance(limit, int) else ("unlimited" if s.get("plan") else "?")
+sync = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(s["last_ok"])) if s.get("last_ok") else "never"
+print(f"  Plan:           {plan}  ({used:,} / {lim} tool calls this month)")
+def vt(v):
+    return tuple(int("".join(c for c in p if c.isdigit()) or 0) for p in str(v).split(".")[:4])
+latest = s.get("latest_version") or ""
+try:
+    mine = open("/opt/opsgate/app/VERSION").read().strip()
+except OSError:
+    mine = ""
+if latest and mine and vt(mine) < vt(latest):
+    print(f"  UPDATE AVAILABLE: {mine} -> {latest}   (sudo opsgate update, or sudo opsgate autoupdate on)")
+print(f"  Last cloud sync: {sync}" + ("  — LICENSE KEY REJECTED: run sudo opsgate license <key>" if s.get("invalid_key") else ""))
+PYEOF
+  fi
+  autoupdate_status
+  access_summary
+  echo "  Writable:       $(list_items "$WRITE_LIST" | tr '\n' ' ')"
+  echo "  Restartable:    $(list_items "$RESTART_LIST" | tr '\n' ' ')"
+  echo "  Static tokens:  $("$PY" "$APP/scripts/tokens.py" --env "$ENVF" --db "$TOKENS_DB" list | grep -c 'created' || true)"
+}
+
+cmd_help() {
+  cat <<EOF2
+${B}opsgate${N} — manage the OpsGate Agent on this server (run with sudo)
+
+  ${B}status${N}                        service, connector URL, plan and permissions
+  ${B}url${N}                           print the connector URL to paste in Claude / ChatGPT
+  ${B}password${N} [--set]              new login password (random, or type your own with --set)
+  ${B}2fa${N} on | off | status          two-step verification (authenticator app) for the login page
+  ${B}token${N} create|list|revoke NAME static tokens for Claude Code, Codex, scripts
+  ${B}license${N} KEY                   use a new license key
+  ${B}allow-write${N} PATH...           let the AI modify files in these folders (with your confirmation)
+  ${B}deny-write${N} PATH...            take write access away again
+  ${B}allow-read${N} PATH...            let it read folders its user cannot read today
+  ${B}deny-read${N} PATH...
+  ${B}allow-restart${N} SERVICE...      let it restart/reload these systemd services (after confirmation)
+  ${B}deny-restart${N} SERVICE...
+  ${B}access${N} [PROFILE...]           choose what the AI may do: readonly, network, asterisk, full (menu if no profile)
+  ${B}permissions${N}                   show what is allowed
+  ${B}db${N} DATABASE                   let db_query read a MySQL/MariaDB database (SELECT only)
+  ${B}config${N} get|set KEY=VALUE      advanced settings (see the docs)
+  ${B}logs${N} [-f]                     agent logs        ${B}audit${N} [N]   last N tool calls
+  ${B}doctor${N}                        check that everything works
+  ${B}autoupdate${N} on [HH:MM] | off | status   install new versions by itself at night (default 03:30, server time)
+  ${B}restart${N} | ${B}update${N} [--domain NAME] | ${B}uninstall${N} [--purge] | ${B}version${N}
+EOF2
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    help|-h|--help) cmd_help ;;
+    version) cat "$APP/VERSION" 2>/dev/null || echo unknown ;;
+    status) need_root status; cmd_status ;;
+    url) need_root url; connector_url || die "No connector URL configured" ;;
+    password)
+      need_root password
+      local pw
+      if [ "${1:-}" = "--set" ]; then "$PY" "$APP/scripts/set_password.py" --env "$ENVF"; pw=""
+      else pw="$("$PY" "$APP/scripts/set_password.py" --env "$ENVF" --random)"; fi
+      restart
+      if [ -n "$pw" ]; then echo; echo "  New login password: ${B}$pw${N}"; echo "  ${D}Shown once. Connected apps must sign in again.${N}"; fi
+      ;;
+    token)
+      need_root token
+      local sub="${1:-list}"; shift || true
+      case "$sub" in
+        create)
+          local t; t="$("$PY" "$APP/scripts/tokens.py" --env "$ENVF" --db "$TOKENS_DB" create "${1:-}")" || exit 1
+          restart
+          echo; echo "  Token for ${1}: ${B}$t${N}"; echo "  ${D}Shown once. Use it as: Authorization: Bearer <token>${N}" ;;
+        list) "$PY" "$APP/scripts/tokens.py" --env "$ENVF" --db "$TOKENS_DB" list ;;
+        revoke) "$PY" "$APP/scripts/tokens.py" --env "$ENVF" --db "$TOKENS_DB" revoke "${1:-}" && restart && ok "Token ${1} revoked" ;;
+        *) die "Use: opsgate token create|list|revoke NAME" ;;
+      esac ;;
+    2fa)
+      need_root 2fa
+      case "${1:-status}" in
+        status) if [ -n "$(envget MCP_TOTP_SECRET)" ]; then ok "Two-step verification is ON"; else echo "Two-step verification is off. Turn it on: sudo opsgate 2fa on"; fi ;;
+        on)
+          [ -t 0 ] || die "Run this in an interactive terminal."
+          [ -z "$(envget MCP_TOTP_SECRET)" ] || die "Already on. Turn it off first to create a new key."
+          local secret code
+          secret="$("$PY" "$APP/scripts/totp_setup.py" new "$(hostname)")" || die "Could not create the key"
+          echo; echo "  Scan the code above with your authenticator app (Google Authenticator, Authy, 1Password...)"
+          echo "  or type this key by hand: ${B}$secret${N}"; echo
+          read -r -p "  Enter the 6-digit code the app shows: " code
+          "$PY" "$APP/scripts/totp_setup.py" check "$secret" "$code" || die "That code is not right. Nothing was changed; run it again."
+          envset "MCP_TOTP_SECRET=$secret"; restart
+          ok "Two-step verification is ON. The login page now asks for password + code." ;;
+        off) "$PY" "$APP/scripts/envfile.py" "$ENVF" unset MCP_TOTP_SECRET; restart; ok "Two-step verification is off" ;;
+        *) die "Use: sudo opsgate 2fa on | off | status" ;;
+      esac ;;
+    license)
+      need_root license
+      local key="${1:-}" cloud
+      [[ "$key" =~ ^og_[A-Za-z0-9_-]{30,}$ ]] || die "That does not look like an OpsGate license key (og_...)"
+      cloud="$(envget OPSGATE_CLOUD_URL)"
+      if [ -n "$cloud" ]; then
+        code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $key" "$cloud/api/v1/license" || true)"
+        [ "$code" = "200" ] || die "OpsGate Cloud did not accept this key (HTTP $code)"
+      fi
+      envset "OPSGATE_LICENSE_KEY=$key"; restart; ok "License key updated" ;;
+    allow-write|allow-read)
+      need_root "$cmd"; [ $# -gt 0 ] || die "Give at least one folder"
+      local p perm list
+      [ "$cmd" = allow-write ] && { perm=rwX; list=$WRITE_LIST; } || { perm=rX; list=$READ_LIST; }
+      for p in "$@"; do
+        p="$(norm_path "$p")"
+        forbidden_dir "$p" && die "Refused: $p is a system or OpsGate folder. Allow a more specific folder."
+        grant "$p" "$perm"; list_add "$list" "$p"; ok "${cmd#allow-} access: $p"
+      done
+      apply; [ "$cmd" = allow-write ] && maybe_restart || true ;;
+    deny-write|deny-read)
+      need_root "$cmd"; [ $# -gt 0 ] || die "Give at least one folder"
+      local p list
+      [ "$cmd" = deny-write ] && list=$WRITE_LIST || list=$READ_LIST
+      for p in "$@"; do
+        p="${p%/}"; list_del "$list" "$p"; revoke "$p"
+        # still readable if it is in the other list
+        if [ "$cmd" = deny-write ] && grep -qxF -- "$p" "$READ_LIST" 2>/dev/null; then grant "$p" rX; fi
+        ok "Removed ${cmd#deny-} access: $p"
+      done
+      apply; [ "$cmd" = deny-write ] && maybe_restart || true ;;
+    allow-restart|deny-restart)
+      need_root "$cmd"; [ $# -gt 0 ] || die "Give at least one service name"
+      local s
+      for s in "$@"; do
+        s="${s%.service}"
+        valid_service "$s" || die "Invalid service name: $s"
+        if [ "$cmd" = allow-restart ]; then
+          systemctl cat "$s" >/dev/null 2>&1 || warn "No systemd unit named $s right now (added anyway)"
+          list_add "$RESTART_LIST" "$s"; ok "May restart: $s (always after your confirmation)"
+        else list_del "$RESTART_LIST" "$s"; ok "May no longer restart: $s"; fi
+      done
+      apply ;;
+    permissions) need_root permissions
+      echo "Writable folders:";  list_items "$WRITE_LIST"  | sed 's/^/  /'
+      echo "Extra readable folders:"; list_items "$READ_LIST" | sed 's/^/  /'
+      echo "Restartable services:"; list_items "$RESTART_LIST" | sed 's/^/  /'
+      access_summary
+      echo "Everything else: read-only, as an unprivileged user (unless full access is on)." ;;
+    access) need_root access
+      if [ $# -eq 0 ]; then
+        access_summary
+        if have_tty; then access_menu; else echo "  Change it with: sudo opsgate access readonly|network|asterisk|full"; fi
+      else
+        local yes=0 pick="readonly" a
+        for a in "$@"; do
+          case "$a" in
+            --yes) yes=1 ;;
+            readonly) ;;
+            network|asterisk|full) pick="$pick,$a" ;;
+            *) die "Unknown profile: $a. Use: readonly, network, asterisk, full" ;;
+          esac
+        done
+        if [[ "$pick" == *full* ]] && [ "$yes" -ne 1 ]; then
+          have_tty || die "Full access needs a typed confirmation: run it in a terminal, or add --yes."
+          echo "${Y}Full access gives the AI the same power as logging in as root.${N}"
+          local c=""; read -r -p "Type FULL to confirm: " c </dev/tty || c=""
+          [ "$c" = "FULL" ] || die "Not confirmed. Nothing changed."
+        fi
+        access_apply "$pick"
+      fi ;;
+    autoupdate) need_root autoupdate
+      case "${1:-status}" in
+        on) autoupdate_on "${2:-03:30}" ;;
+        off) autoupdate_off ;;
+        status) autoupdate_status ;;
+        *) die "Use: sudo opsgate autoupdate on [HH:MM] | off | status" ;;
+      esac ;;
+    db) need_root db
+      local dbname="${1:-}"
+      [[ "$dbname" =~ ^[A-Za-z0-9_$-]{1,64}$ ]] || die "Use: sudo opsgate db DATABASE_NAME   (MySQL / MariaDB on this server)"
+      command -v mysql >/dev/null || die "No mysql/mariadb client on this server."
+      mysql -N -e "SELECT 1" >/dev/null 2>&1 || die "Cannot connect to MySQL/MariaDB as root through its socket."
+      mysql -N -e "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='$dbname'" | grep -qx "$dbname" \
+        || die "No database named $dbname"
+      local dbpw; dbpw="$("$PY" -c 'import secrets; print(secrets.token_hex(24))')"
+      mysql -e "CREATE USER IF NOT EXISTS 'opsgate_ro'@'127.0.0.1' IDENTIFIED BY '$dbpw'; ALTER USER 'opsgate_ro'@'127.0.0.1' IDENTIFIED BY '$dbpw'; GRANT SELECT, SHOW VIEW ON \`$dbname\`.* TO 'opsgate_ro'@'127.0.0.1';"
+      envset "MCP_DB_HOST=127.0.0.1" "MCP_DB_NAME=$dbname" "MCP_DB_USER=opsgate_ro" "MCP_DB_PASSWORD=$dbpw"
+      restart; ok "db_query can now read $dbname (user opsgate_ro, SELECT only)" ;;
+    config) need_root config
+      local allowed="MCP_READ_ROOTS MCP_WRITE_ROOTS MCP_LOG_ROOTS MCP_RUN_ALLOWED MCP_RUN_CONFIRM MCP_RATE_PER_MIN MCP_SERVICES MCP_RESTARTABLE MCP_RELOADABLE MCP_DENY_NAMES MCP_MAX_OUTPUT MCP_RUN_TIMEOUT_MAX MCP_ASTERISK_PREFIXES MCP_OAUTH_REDIRECT_HOSTS MCP_DB_PORT"
+      case "${1:-}" in
+        get) for k in $allowed; do v="$(envget "$k")"; [ -n "$v" ] && echo "$k=$v"; done; true ;;
+        set) shift; [ $# -gt 0 ] || die "Use: sudo opsgate config set KEY=VALUE"
+          local kv
+          for kv in "$@"; do
+            [[ " $allowed " == *" ${kv%%=*} "* ]] || die "Not a configurable setting: ${kv%%=*}. Allowed: $allowed"
+          done
+          envset "$@"; restart ;;
+        unset) shift
+          for k in "$@"; do [[ " $allowed " == *" $k "* ]] || die "Not a configurable setting: $k"; done
+          "$PY" "$APP/scripts/envfile.py" "$ENVF" unset "$@"; restart ;;
+        *) die "Use: sudo opsgate config get | set KEY=VALUE | unset KEY" ;;
+      esac ;;
+    apply|_apply) need_root apply; apply ;;
+    logs) need_root logs; if [ "${1:-}" = "-f" ]; then journalctl -u "$UNIT" -f; else journalctl -u "$UNIT" -n 100 --no-pager; fi ;;
+    audit) need_root audit; tail -n "${1:-20}" /var/log/opsgate/audit.jsonl 2>/dev/null || echo "(no tool calls yet)" ;;
+    doctor) need_root doctor
+      MCP_PUBLIC_URL="$(envget MCP_PUBLIC_URL)" MCP_HOST="$(envget MCP_HOST)" MCP_PORT="$(envget MCP_PORT)" \
+        "$PY" "$APP/scripts/doctor.py" "$@" ;;
+    restart) need_root restart; restart ;;
+    update) need_root update
+      local auto=0; if [ "${1:-}" = "--auto" ]; then auto=1; shift; fi
+      # Never runs a script fetched from the network: the package is verified against the vendor
+      # key pinned on this server first, and the installer that runs comes from inside that package.
+      local cloud tmp; cloud="$(envget OPSGATE_CLOUD_URL)"; [ -n "$cloud" ] || die "No OPSGATE_CLOUD_URL configured"
+      [ -f /etc/opsgate/release.pub.pem ] || die "No pinned release key on this server. Reinstall with the installer from your dashboard."
+      tmp="$(mktemp -d)"
+      curl -fsSL "$cloud/download/opsgate-agent.tar.gz" -o "$tmp/agent.tgz" || { rm -rf "$tmp"; die "Download failed"; }
+      curl -fsSL "$cloud/download/opsgate-agent.tar.gz.sig" -o "$tmp/agent.sig" || { rm -rf "$tmp"; die "Could not download the signature"; }
+      if ! openssl dgst -sha256 -verify /etc/opsgate/release.pub.pem -signature "$tmp/agent.sig" "$tmp/agent.tgz" >/dev/null 2>&1; then
+        rm -rf "$tmp"; die "SIGNATURE INVALID: the update was not signed by the OpsGate vendor. Nothing was changed."
+      fi
+      tar -xzf "$tmp/agent.tgz" -C "$tmp" --no-same-owner
+      if [ "$auto" = 1 ]; then
+        local newv curv
+        newv="$(sed -n 's/^VERSION = "\(.*\)"/\1/p' "$tmp/opsgate-agent/config.py" | head -n1)"
+        curv="$(cat "$APP/VERSION" 2>/dev/null || echo 0)"
+        if [ -z "$newv" ] || [ "$(printf '%s\n%s\n' "$curv" "$newv" | sort -V | tail -n1)" = "$curv" ]; then
+          rm -rf "$tmp"; au_log "up to date ($curv)"; return 0
+        fi
+        local last; last="$(stat -c %Y /var/log/opsgate/audit.jsonl 2>/dev/null || echo 0)"
+        if [ $(( $(date +%s) - last )) -lt 600 ]; then
+          rm -rf "$tmp"; au_log "postponed: the AI used this server in the last 10 minutes ($curv -> $newv)"; return 0
+        fi
+        au_log "updating $curv -> $newv"
+      fi
+      local rc=0
+      bash "$tmp/opsgate-agent/deploy/install.sh" --update --cloud "$cloud" --tarball "$tmp/agent.tgz" --sig "$tmp/agent.sig" "$@" || rc=$?
+      rm -rf "$tmp"
+      if [ "$auto" = 1 ]; then
+        if [ "$rc" = 0 ]; then au_log "updated to $(cat "$APP/VERSION" 2>/dev/null)"; else au_log "update FAILED (rc=$rc); running $(cat "$APP/VERSION" 2>/dev/null)"; fi
+      fi
+      return $rc ;;
+    uninstall) need_root uninstall; bash "$APP/deploy/uninstall.sh" "$@" ;;
+    *) cmd_help; exit 2 ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,27 @@
+#!/bin/bash
+# /usr/local/sbin/opsgate-asterisk — root:root 0755, run by the opsgate user through sudo.
+# Asterisk's control socket only accepts root, so read-only CLI queries need this wrapper. It
+# re-validates everything: one argument, safe characters and a read-only prefix (reloads only with the owner's flag). Anything else
+# exits with code 2 without touching Asterisk.
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8
+
+[ "$#" -eq 1 ] || { echo "usage: $0 \"<show command>\"" >&2; exit 2; }
+cmd="$1"
+[[ "$cmd" =~ ^[A-Za-z0-9_.@:/+\ -]{1,200}$ ]] || { echo "characters not allowed" >&2; exit 2; }
+
+case "$cmd" in
+  "pjsip show "*|"core show channels"|"core show channels "*|"core show calls"|"core show calls "* \
+  |"core show uptime"|"core show uptime "*|"core show version"|"dialplan show"|"dialplan show "* \
+  |"sip show peers"|"odbc show"|"odbc show "*|"cdr show status"|"pjsip list "*)
+    exec /usr/sbin/asterisk -rx "$cmd" ;;
+  "core reload"|"core reload "*|"dialplan reload"|"dialplan reload "*|"pjsip reload"|"pjsip reload "* \
+  |"module reload"|"module reload "*|"queue reload"|"queue reload "*|"sip reload"|"voicemail reload" \
+  |"manager reload"|"logger reload")
+    # Changes the running Asterisk: only when the owner turned on the "asterisk" access profile
+    # (a root-owned flag file that the agent's user cannot create).
+    [ -f /etc/opsgate/asterisk-reload ] || { echo "reload is not enabled: sudo opsgate access asterisk" >&2; exit 2; }
+    exec /usr/sbin/asterisk -rx "$cmd" ;;
+  *)
+    echo "command not allowed" >&2; exit 2 ;;
+esac

@@ -1,0 +1,38 @@
+[Unit]
+Description=OpsGate Agent (self-hosted MCP server)
+Documentation=__DOCS_URL__
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opsgate
+Group=opsgate
+WorkingDirectory=/opt/opsgate/app
+EnvironmentFile=/etc/opsgate/env
+ExecStart=/opt/opsgate/venv/bin/python server.py
+Restart=on-failure
+RestartSec=3
+
+# Hardening. NoNewPrivileges stays off on purpose: sudo (allowed restarts, Asterisk) needs it.
+# systemd installs the seccomp filters below while still privileged, so they do not imply it.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=true
+UMask=0077
+ReadWritePaths=/var/log/opsgate /var/backups/opsgate /var/lib/opsgate
+ReadWritePaths=-/run/sudo -/var/lib/sudo
+# Folders the owner allowed with `opsgate allow-write` are added in opsgate.service.d/write-paths.conf
+
+[Install]
+WantedBy=multi-user.target

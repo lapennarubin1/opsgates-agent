@@ -1,0 +1,8 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.lapennarubin1/opsgates-agent",
+  "description": "Self-hosted MCP server that lets AI assistants operate a Linux server safely: read-only by default, previews and confirmations, local audit log.",
+  "version": "1.1.2",
+  "repository": {"url": "https://github.com/lapennarubin1/opsgates-agent", "source": "github"},
+  "websiteUrl": "https://opsgates.com"
+}
