@@ -87,6 +87,13 @@ pytest -q
 
 Tested with Python 3.12 and 3.13. Dependencies are pinned.
 
+To list the tools without installing anything on a server (for example in an MCP inspector), run the
+stdio check, which uses throw-away state and read-only access:
+
+```bash
+python scripts/stdio_check.py
+```
+
 ## Security
 
 Found a vulnerability? Please read [SECURITY.md](SECURITY.md) and report it privately.
